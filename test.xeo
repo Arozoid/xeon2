@@ -1,0 +1,7 @@
+mkdir epic
+dir epic
+mkdir the
+dir the
+mkdir musical
+print hi
+chmod ../../test.xeo
