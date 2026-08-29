@@ -2,6 +2,7 @@ mod archive;
 mod arch;
 mod endpoints;
 mod home;
+mod http;
 mod model;
 mod ops;
 mod paths;

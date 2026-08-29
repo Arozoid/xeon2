@@ -64,7 +64,11 @@ impl Endpoint {
                 let cached = home.cache_dir().join(cache_name(name));
                 fs::create_dir_all(&cached)
                     .map_err(|e| format!("failed to create {}: {}", cached.display(), e))?;
-                clone_pkg_only(url, &cached)?;
+                if crate::http::is_git_repo(url) {
+                    clone_pkg_only(url, &cached)?;
+                } else {
+                    fetch_static_catalog(url, &cached)?;
+                }
                 let pkg_dir = cached.join(crate::home::PKG_DIR);
                 crate::repo::ensure(&pkg_dir)?;
                 Ok(pkg_dir)
@@ -99,7 +103,11 @@ impl Endpoint {
                 let cached = home.cache_dir().join(cache_name(name));
                 fs::create_dir_all(&cached)
                     .map_err(|e| format!("failed to create {}: {}", cached.display(), e))?;
-                pull_pkg_only(url, &cached)?;
+                if crate::http::is_git_repo(url) {
+                    pull_pkg_only(url, &cached)?;
+                } else {
+                    fetch_static_catalog(url, &cached)?;
+                }
                 let pkg_dir = cached.join(crate::home::PKG_DIR);
                 crate::repo::ensure(&pkg_dir)?;
                 Ok(pkg_dir)
@@ -252,11 +260,33 @@ pub fn find_package(
     Ok(hits)
 }
 
+/// download a static (non-git) http endpoint's catalog: `pkg/repo.db` plus
+/// every package toml it lists, into `dest` (the cached endpoint root).
+fn fetch_static_catalog(url: &str, dest: &Path) -> XResult<()> {
+    let pkg_dir = dest.join(crate::home::PKG_DIR);
+    let db_url = crate::http::join_url(url, "pkg/repo.db");
+    let db_path = pkg_dir.join(crate::repo::REPO_DB);
+
+    // write a throwaway repo.db so xeon knows which tomls to pull next.
+    crate::http::download(&db_url, &db_path)?;
+    let names = crate::repo::read(&pkg_dir);
+    if names.is_empty() {
+        return Err(format!(
+            "endpoint {} publishes an empty pkg/repo.db (nothing to install)",
+            url
+        ));
+    }
+    for name in &names {
+        let toml_url = crate::http::join_url(url, &format!("pkg/{}", name));
+        crate::http::download(&toml_url, &pkg_dir.join(name))?;
+    }
+    Ok(())
+}
+
 /// clone only the `pkg/` tree of an http git endpoint into `dest`, leaving
 /// lib/ and bin/ untouched. the working tree materializes package tomls and
 /// repo.db as blobs are fetched.
-fn clone_pkg_only(url: &str, dest: &Path) -> XResult<()> {
-    if dest.join(".git").is_dir() {
+fn clone_pkg_only(url: &str, dest: &Path) -> XResult<()> {    if dest.join(".git").is_dir() {
         return pull_pkg_only(url, dest);
     }
     if let Some(parent) = dest.parent()
@@ -322,20 +352,55 @@ pub fn fetch_package_files(
     let work = root.join("work").join(&pkg.name);
     fs::create_dir_all(&work)
         .map_err(|e| format!("failed to create {}: {}", work.display(), e))?;
-    if work.join(".git").is_dir() {
-        pull_pkg_files(url, &work, pkg)?;
-    } else {
-        let status = Command::new("git")
-            .args(["clone", "--depth", "1", "--filter=blob:none", "--sparse", url])
-            .arg(&work)
-            .status()
-            .map_err(|e| format!("git is not available ({})", e))?;
-        if !status.success() {
-            return Err(format!("failed to fetch package files from {}", url));
+    if crate::http::is_git_repo(url) {
+        if work.join(".git").is_dir() {
+            pull_pkg_files(url, &work, pkg)?;
+        } else {
+            let status = Command::new("git")
+                .args(["clone", "--depth", "1", "--filter=blob:none", "--sparse", url])
+                .arg(&work)
+                .status()
+                .map_err(|e| format!("git is not available ({})", e))?;
+            if !status.success() {
+                return Err(format!("failed to fetch package files from {}", url));
+            }
+            materialize_pkg_files(&work, pkg)?;
         }
-        materialize_pkg_files(&work, pkg)?;
+    } else {
+        fetch_static_pkg_files(url, &work, pkg)?;
     }
     Ok(work)
+}
+
+/// download a static endpoint's `lib/` and `bin/` files for a single package,
+/// naming binaries `<bin>-<arch>-<platform>` from the host (e.g. fs-x86_64-linux)
+/// but staging them as the plain `<bin>` name so `place_package` installs them
+/// without the arch suffix.
+fn fetch_static_pkg_files(url: &str, work: &Path, pkg: &Package) -> XResult<()> {
+    for file in &pkg.lib {
+        let src = crate::http::join_url(url, &format!("lib/{}/{}", pkg.name, file));
+        let dest = work.join("lib").join(file);
+        crate::http::download(&src, &dest)?;
+    }
+    let arch_platform = crate::arch::arch_platform();
+    let exe = if crate::arch::host_platform() == "windows" { ".exe" } else { "" };
+    for file in &pkg.bin {
+        let remote = format!("{}-{}{}", file, arch_platform, exe);
+        let src = crate::http::join_url(url, &format!("bin/{}", remote));
+        let dest = work.join("bin").join(file);
+        crate::http::download(&src, &dest)?;
+    }
+    for (dir, file) in pkg.owned_files() {
+        let path = work.join(dir).join(file);
+        if !path.is_file() {
+            return Err(format!(
+                "missing {} in http package '{}'",
+                path.display(),
+                pkg.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn pull_pkg_files(_url: &str, work: &Path, pkg: &Package) -> XResult<()> {
