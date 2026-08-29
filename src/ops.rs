@@ -73,49 +73,41 @@ fn resolve_spec(home: &Home, reg: &EndpointRegistry, spec: &str) -> XResult<Vec<
         ));
     }
 
-    // 2. bare git url, with optional #pkg selector
+    // 2. bare http url, with optional #pkg selector — treat as an ad-hoc
+    //    http endpoint, hook its pkg/ catalog, then install from it.
     let (url_part, selector) = match trimmed.split_once('#') {
         Some((url, sel)) => (url, Some(sel.to_string())),
         None => (trimmed, None),
     };
-    if crate::paths::looks_like_git_url(url_part) {
-        let dest = dl_dir(home, &format!("git:{}", url_part));
-        if !dest.is_dir() {
-            clone_git(url_part, &dest)?;
-        }
-        return packages_from_root(&dest, &format!("git:{}", url_part), selector.as_deref());
+    if crate::paths::looks_like_http_url(url_part) {
+        let ep = endpoints::adhoc_endpoint(url_part, url_part)?;
+        return resolve_from_endpoint(home, &ep, selector.as_deref());
     }
 
     // 3. <endpoint>/<package>
     if let Some((ep_name, pkg_name)) = trimmed.split_once('/') {
         if let Some(ep) = reg.get(ep_name) {
-            let root = ep.ensure(home)?;
-            let found = packages_from_root(&root, ep_name, Some(pkg_name))?;
-            if found.is_empty() {
-                return Err(format!(
-                    "package '{}' not found in endpoint '{}'",
-                    pkg_name, ep_name
-                ));
-            }
-            return Ok(found);
+            return resolve_from_endpoint(home, ep, Some(pkg_name));
         }
         return Err(format!("unknown endpoint or local path: '{}'", trimmed));
     }
 
-    // 4. bare package name — search every endpoint
-    let mut hits: Vec<(String, PathBuf, Package)> = Vec::new();
+    // 4. bare package name — search every endpoint, hooking http ones for the
+    //    catalog so their tomls are available at install time.
+    let mut hits: Vec<Resolved> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for ep in &reg.endpoint {
-        match ep.ensure(home) {
-            Ok(root) => {
-                let toml = root.join("pkg").join(format!("{}.toml", trimmed));
-                if toml.is_file()
-                    && let Ok(pkg) = Package::read(&toml)
-                {
-                    hits.push((ep.name().to_string(), root, pkg));
+        match resolve_from_endpoint(home, ep, Some(trimmed)) {
+            Ok(mut resolved) => hits.append(&mut resolved),
+            Err(e) => {
+                if ep.is_http() {
+                    warnings.push(format!(
+                        "endpoint '{}' unavailable ({})",
+                        ep.name(),
+                        e
+                    ));
                 }
             }
-            Err(e) => warnings.push(format!("endpoint '{}' unavailable ({})", ep.name(), e)),
         }
     }
     if hits.is_empty() {
@@ -129,15 +121,61 @@ fn resolve_spec(home: &Home, reg: &EndpointRegistry, spec: &str) -> XResult<Vec<
     if hits.len() > 1 {
         ui::warn(format!(
             "package '{}' found in multiple endpoints; using '{}'",
-            trimmed, hits[0].0
+            trimmed, hits[0].source_label
         ));
     }
-    let (label, root, pkg) = hits.remove(0);
+    Ok(vec![hits.remove(0)])
+}
+
+/// hook an endpoint (fetching its catalog if needed), locate one package, and
+/// produce a Resolved with a usable source_root (full tree for local, staged
+/// lib/bin tree fetched at install time for http).
+fn resolve_from_endpoint(
+    home: &Home,
+    ep: &Endpoint,
+    selector: Option<&str>,
+) -> XResult<Vec<Resolved>> {
+    let pkg_dir = ep.hook(home)?;
+
+    // if no selector, return every package in the endpoint's catalog
+    if selector.is_none() {
+        let mut out = Vec::new();
+        for (_toml, pkg) in endpoints::scan_dir(&pkg_dir)? {
+            let source_root = source_root_for(home, ep, &pkg)?;
+            out.push(Resolved {
+                source_label: ep.name().to_string(),
+                source_root,
+                pkg,
+            });
+        }
+        if out.is_empty() {
+            return Err(format!("no packages found in endpoint '{}'", ep.name()));
+        }
+        return Ok(out);
+    }
+
+    let name = selector.unwrap();
+    let toml = pkg_dir.join(format!("{name}.toml"));
+    if !toml.is_file() {
+        return Err(format!("package '{}' not found in endpoint '{}'", name, ep.name()));
+    }
+    let pkg = Package::read(&toml)?;
+    let source_root = source_root_for(home, ep, &pkg)?;
     Ok(vec![Resolved {
-        source_label: label,
-        source_root: root,
+        source_label: ep.name().to_string(),
+        source_root,
         pkg,
     }])
+}
+
+/// the file tree to copy from when installing `pkg` from `ep`: the whole
+/// endpoint tree for local endpoints, a staged lib/bin tree for http ones.
+fn source_root_for(home: &Home, ep: &Endpoint, pkg: &Package) -> XResult<PathBuf> {
+    if ep.is_http() {
+        endpoints::fetch_package_files(home, ep, pkg)
+    } else {
+        Ok(ep.pkg_dir(home).parent().unwrap_or_else(|| Path::new(".")).to_path_buf())
+    }
 }
 
 fn packages_from_root(root: &Path, label: &str, selector: Option<&str>) -> XResult<Vec<Resolved>> {
@@ -197,6 +235,9 @@ fn install_resolved(
     install_dependencies(home, reg, &r.pkg.depends, force, dry_run, stack, report)?;
 
     let (libs, bins) = place_package(home, &r.pkg, &r.source_root, &r.source_label, dry_run)?;
+    if !dry_run {
+        crate::repo::add(&home.pkg_dir(), &name)?;
+    }
     let action = if dry_run {
         "would install".yellow().to_string()
     } else {
@@ -232,20 +273,22 @@ fn install_dependencies(
             return Err(format!("dependency cycle involving '{}'", dep));
         }
         stack.push(dep.clone());
-        let hits = crate::endpoints::find_package(home, reg, dep)?;
-        let (label, root, mut pkg) = hits[0].clone();
-        if hits.len() > 1 {
-            ui::warn(format!(
-                "dependency '{}' found in multiple endpoints; using '{}'",
-                dep, label
-            ));
+
+        let mut found: Option<Resolved> = None;
+        for ep in &reg.endpoint {
+            match resolve_from_endpoint(home, ep, Some(dep)) {
+                Ok(mut resolved) if !resolved.is_empty() => {
+                    found = resolved.pop();
+                    break;
+                }
+                _ => {}
+            }
         }
-        pkg.origin = Some(format!("endpoint:{}", label));
-        let r = Resolved {
-            source_label: label,
-            source_root: root,
-            pkg,
+        let mut r = match found {
+            Some(r) => r,
+            None => return Err(format!("dependency '{}' not found in any endpoint", dep)),
         };
+        r.pkg.origin = Some(format!("endpoint:{}", r.source_label));
         install_resolved(home, reg, r, force, dry_run, stack, report)?;
         stack.pop();
     }
@@ -352,6 +395,7 @@ pub fn remove(home: &Home, name: &str, yes: bool) -> XResult<()> {
         }
     }
     fs::remove_file(&toml).map_err(|e| format!("failed to remove {}: {}", toml.display(), e))?;
+    crate::repo::remove(&home.pkg_dir(), name)?;
     ui::ok(format!(
         "removed {} {} ({} files)",
         name, pkg.version, removed
@@ -405,14 +449,14 @@ pub fn search(home: &Home, reg: &EndpointRegistry, query: &str) -> XResult<()> {
     let q = query.to_ascii_lowercase();
     let mut rows: Vec<Vec<String>> = Vec::new();
     for ep in &reg.endpoint {
-        let root = match ep.ensure(home) {
-            Ok(root) => root,
+        let pkgs = match ep.catalog(home) {
+            Ok(list) => list,
             Err(e) => {
                 ui::warn(format!("endpoint '{}' unavailable ({})", ep.name(), e));
                 continue;
             }
         };
-        for (_toml, pkg) in endpoints::scan_root(&root)? {
+        for (_toml, pkg) in pkgs {
             let haystack = format!(
                 "{} {}",
                 pkg.name.to_ascii_lowercase(),
@@ -489,8 +533,8 @@ pub fn update(home: &Home, reg: &EndpointRegistry) -> XResult<()> {
     let mut total = 0;
     for ep in &reg.endpoint {
         match ep.refresh(home) {
-            Ok(root) => {
-                let count = endpoints::scan_root(&root)?.len();
+            Ok(pkg_dir) => {
+                let count = endpoints::scan_dir(&pkg_dir)?.len();
                 total += count;
                 ui::ok(format!(
                     "refreshed endpoint '{}' ({} packages)",
@@ -545,7 +589,7 @@ pub fn upgrade(
             }
         };
 
-        let (label, root) = match origin_to_source(home, reg, &origin) {
+        let (label, catalog_dir, http_url) = match origin_to_source(home, reg, &origin) {
             Ok(Some(src)) => src,
             Ok(None) => {
                 ui::warn(format!(
@@ -563,7 +607,7 @@ pub fn upgrade(
             }
         };
 
-        let candidate_toml = root.join("pkg").join(format!("{}.toml", pkg.name));
+        let candidate_toml = catalog_dir.join(format!("{}.toml", pkg.name));
         let candidate = match Package::read(&candidate_toml) {
             Ok(c) => c,
             Err(_) => {
@@ -582,7 +626,18 @@ pub fn upgrade(
             continue;
         }
 
-        let (libs, bins) = place_package(home, &candidate, &root, &label, dry_run)?;
+        let source_root = match http_url {
+            Some(url) => {
+                let ep = endpoints::adhoc_endpoint(&origin, &url)?;
+                endpoints::fetch_package_files(home, &ep, &candidate)?
+            }
+            None => catalog_dir
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+        };
+
+        let (libs, bins) = place_package(home, &candidate, &source_root, &label, dry_run)?;
         if dry_run {
             ui::info(format!(
                 "would upgrade {} {} -> {} ({} lib, {} bin)",
@@ -614,15 +669,21 @@ pub fn upgrade(
     Ok(())
 }
 
-/// turn a recorded origin string into a usable (label, root) source
+/// turn a recorded origin string into (label, catalog_dir, http_url_or_none) —
+/// when the origin is an http endpoint the files are staged at upgrade time
+/// from `http_url`.
 fn origin_to_source(
     home: &Home,
     reg: &EndpointRegistry,
     origin: &str,
-) -> XResult<Option<(String, PathBuf)>> {
+) -> XResult<Option<(String, PathBuf, Option<String>)>> {
     if let Some(ep) = reg.get(origin) {
-        let root = ep.ensure(home)?;
-        return Ok(Some((origin.to_string(), root)));
+        let pkg_dir = ep.hook(home)?;
+        let url = match ep {
+            endpoints::Endpoint::Http { url, .. } => Some(url.clone()),
+            endpoints::Endpoint::Local { .. } => None,
+        };
+        return Ok(Some((origin.to_string(), pkg_dir, url)));
     }
     if let Some(rest) = origin.strip_prefix("path:") {
         let path = PathBuf::from(rest);
@@ -631,21 +692,25 @@ fn origin_to_source(
             if !dest.is_dir() {
                 archive::extract(&path, &dest)?;
             }
-            return Ok(Some((format!("path:{}", rest), dest)));
+            return Ok(Some((
+                format!("path:{}", rest),
+                dest.join(crate::home::PKG_DIR),
+                None,
+            )));
         }
         if path.is_dir() {
-            return Ok(Some((format!("path:{}", rest), path)));
+            return Ok(Some((
+                format!("path:{}", rest),
+                path.join(crate::home::PKG_DIR),
+                None,
+            )));
         }
         return Ok(None);
     }
-    if let Some(url) = origin.strip_prefix("git:") {
-        let dest = dl_dir(home, origin);
-        if !dest.is_dir() {
-            clone_git(url, &dest)?;
-        } else {
-            pull_git(&dest).ok();
-        }
-        return Ok(Some((origin.to_string(), dest)));
+    if let Some(url) = origin.strip_prefix("http:") {
+        let ep = endpoints::adhoc_endpoint(origin, url)?;
+        let pkg_dir = ep.hook(home)?;
+        return Ok(Some((origin.to_string(), pkg_dir, Some(url.to_string()))));
     }
     Ok(None)
 }
@@ -827,7 +892,7 @@ pub fn doctor(home: &Home, reg: &EndpointRegistry) -> XResult<()> {
 
     match Command::new("git").arg("--version").output() {
         Ok(_) => ui::ok("git available"),
-        Err(_) => ui::warn("git not found — git endpoints will not work"),
+        Err(_) => ui::warn("git not found — http endpoints will not work"),
     }
 
     let xeo_bin = home.bin_dir().join("xeo");
@@ -879,7 +944,7 @@ pub fn doctor(home: &Home, reg: &EndpointRegistry) -> XResult<()> {
 }
 
 fn endpoint_kind(ep: &Endpoint) -> &'static str {
-    if ep.is_git() { "git" } else { "local" }
+    if ep.is_http() { "http" } else { "local" }
 }
 
 //============================================================//
@@ -964,34 +1029,4 @@ fn dl_root(home: &Home) -> PathBuf {
 /// cache dir for downloaded (url/archive) sources
 fn dl_dir(home: &Home, key: &str) -> PathBuf {
     dl_root(home).join(cache_name(key))
-}
-
-fn clone_git(url: &str, dest: &Path) -> XResult<()> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
-    }
-    let ok = Command::new("git")
-        .args(["clone", "--depth", "1", url])
-        .arg(dest)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        return Err(format!("failed to clone {}", url));
-    }
-    Ok(())
-}
-
-fn pull_git(dest: &Path) -> XResult<()> {
-    let ok = Command::new("git")
-        .args(["-C", dest.to_str().unwrap_or("."), "pull", "--ff-only"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if ok {
-        Ok(())
-    } else {
-        Err("git pull failed".into())
-    }
 }

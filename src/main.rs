@@ -4,6 +4,7 @@ mod home;
 mod model;
 mod ops;
 mod paths;
+mod repo;
 mod ui;
 
 use clap::{Parser, Subcommand};
@@ -22,7 +23,7 @@ const ABOUT: &str = "xeon — the 'modern' package manager for .xeo";
     version = VERSION,
     about = ABOUT,
     arg_required_else_help = true,
-    after_help = "endpoints are trees sharing the xeon layout (lib/, bin/, pkg/).\ninstall from a local path, a .tar.gz archive, a git url, a named\nendpoint (endpoint/pkg), or a bare package name searched across endpoints."
+    after_help = "endpoints are trees sharing the xeon layout (lib/, bin/, pkg/).\ninstall from a local path, a .tar.gz archive, an http url, a named\nendpoint (endpoint/pkg), or a bare package name searched across endpoints."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -33,10 +34,10 @@ struct Cli {
 enum UserCommands {
     /// scaffold the ~/.xeon install tree and endpoints file
     Init,
-    /// install a package from a path, archive, git url, endpoint, or name
+    /// install a package from a path, archive, http url, endpoint, or name
     #[command(visible_alias = "add")]
     Install {
-        /// package spec: name | endpoint/name | path | archive | git-url[#name]
+        /// package spec: name | endpoint/name | path | archive | http-url[#name]
         pkg: String,
         /// overwrite an already-installed package
         #[arg(short, long)]
@@ -60,7 +61,7 @@ enum UserCommands {
     Search { query: String },
     /// show metadata for an installed package (or any endpoint package)
     Info { pkg: String },
-    /// refresh git endpoints from their origin
+    /// refresh http endpoints from their origin
     Update,
     /// upgrade installed packages from their recorded origins
     Upgrade {
@@ -110,7 +111,7 @@ enum UserCommands {
 
 #[derive(Subcommand)]
 enum EndpointCmd {
-    /// add an endpoint (git:// or path)
+    /// add an endpoint (http:// or path)
     Add { name: String, location: String },
     /// remove an endpoint by name
     #[command(visible_alias = "rm")]
@@ -183,14 +184,14 @@ fn handle_endpoint(
             let ep = endpoints::adhoc_endpoint(&name, &location)?;
             reg.add(ep.clone())?;
             reg.save(home)?;
-            let root = ep.ensure(home)?;
-            let count = endpoints::scan_root(&root)?.len();
-            let kind = if ep.is_git() { "git" } else { "local" };
+            let pkg_dir = ep.hook(home)?;
+            let count = endpoints::scan_dir(&pkg_dir)?.len();
+            let kind = if ep.is_http() { "http" } else { "local" };
             ui::ok(format!(
                 "added {} endpoint '{}' at {} ({} packages)",
                 kind,
                 name.cyan(),
-                root.display(),
+                pkg_dir.display(),
                 count
             ));
             Ok(())
@@ -210,22 +211,13 @@ fn handle_endpoint(
             }
             let mut rows: Vec<Vec<String>> = Vec::new();
             for ep in &reg.endpoint {
-                let kind = if ep.is_git() { "git" } else { "local" };
+                let kind = if ep.is_http() { "http" } else { "local" };
                 let loc = match ep {
                     endpoints::Endpoint::Local { path, .. } => path.display().to_string(),
-                    endpoints::Endpoint::Git { url, .. } => url.clone(),
+                    endpoints::Endpoint::Http { url, .. } => url.clone(),
                 };
-                let root = ep
-                    .ensure(home)
-                    .ok()
-                    .map(|r| r.display().to_string())
-                    .unwrap_or_default();
-                let count = ep
-                    .ensure(home)
-                    .ok()
-                    .and_then(|r| endpoints::scan_root(&r).ok())
-                    .map(|v| v.len())
-                    .unwrap_or(0);
+                let root = ep.root(home).display().to_string();
+                let count = ep.catalog(home).ok().map(|v| v.len()).unwrap_or(0);
                 rows.push(vec![
                     ep.name().to_string(),
                     kind.to_string(),
@@ -239,7 +231,7 @@ fn handle_endpoint(
         }
         EndpointCmd::Path { name } => match reg.get(&name) {
             Some(ep) => {
-                let root = ep.ensure(home)?;
+                let root = ep.root(home);
                 println!("{}", root.display());
                 Ok(())
             }

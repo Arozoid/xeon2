@@ -12,17 +12,10 @@ pub fn child_path(base: &Path, entry: &str) -> crate::home::XResult<PathBuf> {
     Ok(base.join(entry))
 }
 
-/// is this a git-style endpoint location (http(s) url, ssh url, scp syntax)?
-pub fn looks_like_git_url(location: &str) -> bool {
+/// is this an http endpoint location (http(s) url)?
+pub fn looks_like_http_url(location: &str) -> bool {
     let lower = location.to_ascii_lowercase();
-    lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower.starts_with("git://")
-        || lower.starts_with("git@")
-        || lower.starts_with("ssh://")
-        || lower.starts_with("git+http:")
-        || lower.starts_with("git+https:")
-        || lower.starts_with("file://")
+    lower.starts_with("http://") || lower.starts_with("https://")
 }
 
 /// quickly sanitize a string into a filesystem-safe cache name
@@ -67,12 +60,14 @@ mod tests {
     }
 
     #[test]
-    fn git_url_detection() {
-        assert!(looks_like_git_url("https://github.com/user/repo.git"));
-        assert!(looks_like_git_url("git@github.com:user/repo.git"));
-        assert!(looks_like_git_url("ssh://git@host/repo.git"));
-        assert!(!looks_like_git_url("/home/user/pkgs"));
-        assert!(!looks_like_git_url("printc"));
+    fn http_url_detection() {
+        assert!(looks_like_http_url("https://github.com/user/repo.git"));
+        assert!(looks_like_http_url("http://host/repo"));
+        assert!(!looks_like_http_url("git@github.com:user/repo.git"));
+        assert!(!looks_like_http_url("ssh://git@host/repo.git"));
+        assert!(!looks_like_http_url("git://host/repo.git"));
+        assert!(!looks_like_http_url("/home/user/pkgs"));
+        assert!(!looks_like_http_url("printc"));
     }
 
     #[test]

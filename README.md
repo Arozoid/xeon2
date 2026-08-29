@@ -56,7 +56,12 @@ bin = ["printc"]
 
 xeon doesn't depend on one central package repository, instead allowing package endpoints to be configured locally and searched as a collection.
 
-an endpoint is simply another tree using the same `lib/`, `bin/`, and `pkg/` layout, meaning a package repository can be a directory, a git repository, or another source that provides the expected structure.
+an endpoint is simply another tree using the same `lib/`, `bin/`, and `pkg/` layout, meaning a package repository can be a directory or a git source that provides the expected structure.
+
+local endpoints are read directly from the directory you point xeon at. http endpoints
+(`http://` / `https://`) are handled more cheaply: xeon only pulls their `pkg/` catalog
+(package tomls plus a generated `repo.db`) into `~/.xeon/cache/<name>`, and fetches the
+actual `lib/`/`bin/` files for a package only when you install or upgrade it.
 
 packages can be referenced through a specific endpoint:
 
@@ -70,11 +75,13 @@ or searched across every configured endpoint with a normal package name:
 xeon install printc
 ```
 
-this keeps package discovery separate from package installation, so adding another endpoint expands where xeon can find packages without changing the package format itself.
+`search`, `list`, and `info` only read local state and the cached catalogs — they never touch
+the network. this keeps package discovery separate from package installation, so adding another
+endpoint expands where xeon can find packages without changing the package format itself.
 
 ## installing packages
 
-packages can come from several different sources, with xeon accepting a local package tree, an archive, a git url, a named endpoint package, or a bare package name searched across configured endpoints.
+packages can come from several different sources, with xeon accepting a local package tree, an archive, an http url, a named endpoint package, or a bare package name searched across configured endpoints.
 
 ```sh
 xeon install ./my-package
@@ -122,7 +129,7 @@ package discovery searches every configured endpoint for matching names or queri
 xeon search color
 ```
 
-git endpoints can be refreshed from their origins with:
+http endpoints can be refreshed from their origins with:
 
 ```sh
 xeon update
@@ -194,12 +201,12 @@ xeon version
 
 ```text
 init       scaffold the ~/.xeon install tree and endpoints file
-install    install a package from a path, archive, git url, endpoint, or name
+install    install a package from a path, archive, http url, endpoint, or name
 remove     remove an installed package and its files
 list       list installed packages
 search     search every endpoint for packages matching a query
 info       show metadata for an installed package or endpoint package
-update     refresh git endpoints from their origin
+update     refresh http endpoints from their origin
 upgrade    upgrade installed packages from their recorded origins
 endpoint   manage package endpoints
 new        scaffold a new package tree

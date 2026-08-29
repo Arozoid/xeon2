@@ -116,12 +116,13 @@ const ENDPOINTS_TEMPLATE: &str = "# xeon endpoints — where packages are instal
 #
 # local endpoints point straight at a directory on disk.
 #   kind = \"local\"  path = \"/absolute/path\"
-# git endpoints are cloned into ~/.xeon/cache/<name> and refreshed on update.
-#   kind = \"git\"  url = \"https://github.com/user/xeo-pkgs.git\"
+# http endpoints have only their pkg/ catalog fetched into ~/.xeon/cache/<name>
+# and are refreshed on update.
+#   kind = \"http\"  url = \"https://github.com/user/xeo-pkgs.git\"
 #
 # [[endpoint]]
 # name = \"hub\"
-# kind = \"git\"
+# kind = \"http\"
 # url = \"https://github.com/rustle/xeo-hub.git\"
 #
 # [[endpoint]]

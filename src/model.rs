@@ -18,7 +18,7 @@ pub struct Package {
     pub lib: Vec<String>,
     /// executables under `bin/` that belong to this package
     pub bin: Vec<String>,
-    /// where this package was installed from (`<endpoint>` / `path:<path>` / `git:<url>`)
+    /// where this package was installed from (`<endpoint>` / `path:<path>` / `http:<url>`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
 }

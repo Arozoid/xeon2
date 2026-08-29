@@ -7,28 +7,46 @@ use serde::{Deserialize, Serialize};
 
 use crate::home::{Home, XResult};
 use crate::model::Package;
-use crate::paths::{cache_name, looks_like_git_url};
+use crate::paths::{cache_name, looks_like_http_url};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Endpoint {
     Local { name: String, path: PathBuf },
-    Git { name: String, url: String },
+    Http { name: String, url: String },
 }
 
 impl Endpoint {
     pub fn name(&self) -> &str {
         match self {
-            Endpoint::Local { name, .. } | Endpoint::Git { name, .. } => name,
+            Endpoint::Local { name, .. } | Endpoint::Http { name, .. } => name,
         }
     }
 
-    pub fn is_git(&self) -> bool {
-        matches!(self, Endpoint::Git { .. })
+    pub fn is_http(&self) -> bool {
+        matches!(self, Endpoint::Http { .. })
     }
 
-    /// ensure this endpoint's tree is present locally (clone git, verify local)
-    pub fn ensure(&self, home: &Home) -> XResult<PathBuf> {
+    /// for a local endpoint: the on-disk tree root. for an http endpoint: the
+    /// cache directory where its pkg/ catalog is (or will be) stored.
+    pub fn root(&self, home: &Home) -> PathBuf {
+        match self {
+            Endpoint::Local { path, .. } => path.clone(),
+            Endpoint::Http { name, .. } => home.cache_dir().join(cache_name(name)),
+        }
+    }
+
+    /// the `pkg/` directory holding this endpoint's catalog
+    pub fn pkg_dir(&self, home: &Home) -> PathBuf {
+        self.root(home).join(crate::home::PKG_DIR)
+    }
+
+    /// fetch/hook this endpoint's catalog (pkg/*) so it is usable locally.
+    ///
+    /// - local: verify the tree and ensure a repo.db catalog exists
+    /// - http:  fetch only `pkg/` (repo.db + package tomls) into cache, never
+    ///          lib/ or bin/. this is only called when installing/updating.
+    pub fn hook(&self, home: &Home) -> XResult<PathBuf> {
         match self {
             Endpoint::Local { path, .. } => {
                 if !path.is_dir() {
@@ -38,52 +56,62 @@ impl Endpoint {
                         path.display()
                     ));
                 }
-                Ok(path.clone())
+                let pkg_dir = path.join(crate::home::PKG_DIR);
+                crate::repo::ensure(&pkg_dir)?;
+                Ok(pkg_dir)
             }
-            Endpoint::Git { name, url } => {
+            Endpoint::Http { name, url } => {
                 let cached = home.cache_dir().join(cache_name(name));
-                if cached.is_dir() {
-                    return Ok(cached);
-                }
-                clone_git(url, &cached)
+                fs::create_dir_all(&cached)
+                    .map_err(|e| format!("failed to create {}: {}", cached.display(), e))?;
+                clone_pkg_only(url, &cached)?;
+                let pkg_dir = cached.join(crate::home::PKG_DIR);
+                crate::repo::ensure(&pkg_dir)?;
+                Ok(pkg_dir)
             }
         }
     }
 
-    /// pull the latest snapshot of a git endpoint (no-op for local)
-    pub fn refresh(&self, home: &Home) -> XResult<PathBuf> {
-        let root = self.ensure(home)?;
-        if let Endpoint::Git { .. } = self
-            && cmd_output(
-                "git",
-                &["-C", root.to_str().unwrap_or("."), "pull", "--ff-only"],
-            )
-            .is_err()
-        {
-            // shallow clone left in a detached state — just reset to origin head
-            cmd_output(
-                "git",
-                &["-C", root.to_str().unwrap_or("."), "fetch", "origin"],
-            )?;
-            cmd_output(
-                "git",
-                &[
-                    "-C",
-                    root.to_str().unwrap_or("."),
-                    "reset",
-                    "--hard",
-                    "origin/HEAD",
-                ],
-            )?;
+    /// the packages this endpoint currently lists, without any network access.
+    /// http endpoints only read what is already in the cache (if hooked).
+    pub fn catalog(&self, home: &Home) -> XResult<Vec<(PathBuf, Package)>> {
+        let pkg_dir = self.pkg_dir(home);
+        if !pkg_dir.is_dir() {
+            return Ok(Vec::new());
         }
-        Ok(root)
+        let mut out = Vec::new();
+        for (toml, pkg) in scan_dir(&pkg_dir)? {
+            out.push((toml, pkg));
+        }
+        Ok(out)
+    }
+
+    /// ensure the cached catalog is usable, fetching it if a local git tree is
+    /// already present but stale. used by `xeon update`.
+    pub fn refresh(&self, home: &Home) -> XResult<PathBuf> {
+        match self {
+            Endpoint::Local { .. } => {
+                let pkg_dir = self.pkg_dir(home);
+                crate::repo::ensure(&pkg_dir)?;
+                Ok(pkg_dir)
+            }
+            Endpoint::Http { name, url } => {
+                let cached = home.cache_dir().join(cache_name(name));
+                fs::create_dir_all(&cached)
+                    .map_err(|e| format!("failed to create {}: {}", cached.display(), e))?;
+                pull_pkg_only(url, &cached)?;
+                let pkg_dir = cached.join(crate::home::PKG_DIR);
+                crate::repo::ensure(&pkg_dir)?;
+                Ok(pkg_dir)
+            }
+        }
     }
 }
 
 /// build an ad-hoc endpoint (not stored in the registry) from a location string
 pub fn adhoc_endpoint(name: &str, location: &str) -> XResult<Endpoint> {
-    if looks_like_git_url(location) {
-        Ok(Endpoint::Git {
+    if looks_like_http_url(location) {
+        Ok(Endpoint::Http {
             name: name.to_string(),
             url: location.to_string(),
         })
@@ -143,13 +171,12 @@ impl EndpointRegistry {
     }
 }
 
-/// scan a package tree root for `pkg/*.toml` manifests
-pub fn scan_root(root: &Path) -> XResult<Vec<(PathBuf, Package)>> {
-    let pkg_dir = root.join(crate::home::PKG_DIR);
+/// scan a `pkg/` directory for `*.toml` manifests (the catalog source of truth)
+pub fn scan_dir(pkg_dir: &Path) -> XResult<Vec<(PathBuf, Package)>> {
     if !pkg_dir.is_dir() {
         return Ok(Vec::new());
     }
-    let entries = fs::read_dir(&pkg_dir)
+    let entries = fs::read_dir(pkg_dir)
         .map_err(|e| format!("failed to read {}: {}", pkg_dir.display(), e))?;
     let mut found: Vec<(PathBuf, Package)> = Vec::new();
     for entry in entries.flatten() {
@@ -165,7 +192,14 @@ pub fn scan_root(root: &Path) -> XResult<Vec<(PathBuf, Package)>> {
     Ok(found)
 }
 
-/// locate a package across every configured endpoint
+/// scan a package tree root for `pkg/*.toml` manifests
+pub fn scan_root(root: &Path) -> XResult<Vec<(PathBuf, Package)>> {
+    scan_dir(&root.join(crate::home::PKG_DIR))
+}
+
+/// locate a package across every configured endpoint, without network access.
+/// http endpoints only consult the metadata already in the cache; run `hook`
+/// (during install/update) to fetch remote metadata.
 pub fn find_package(
     home: &Home,
     reg: &EndpointRegistry,
@@ -175,19 +209,15 @@ pub fn find_package(
     let mut warnings: Vec<String> = Vec::new();
 
     for ep in &reg.endpoint {
-        match ep.ensure(home) {
-            Ok(root) => {
-                let toml = root
-                    .join(crate::home::PKG_DIR)
-                    .join(format!("{}.toml", name));
-                if !toml.is_file() {
-                    continue;
-                }
-                if let Ok(pkg) = Package::read(&toml) {
-                    hits.push((ep.name().to_string(), root, pkg));
-                }
-            }
-            Err(_) => warnings.push(format!("endpoint '{}' unavailable (skipped)", ep.name())),
+        let pkg_dir = ep.pkg_dir(home);
+        let toml = pkg_dir.join(format!("{}.toml", name));
+        if !toml.is_file() {
+            continue;
+        }
+        if let Ok(pkg) = Package::read(&toml) {
+            hits.push((ep.name().to_string(), pkg_dir, pkg));
+        } else {
+            warnings.push(format!("endpoint '{}' has an invalid catalog entry", ep.name()));
         }
     }
 
@@ -201,7 +231,13 @@ pub fn find_package(
     Ok(hits)
 }
 
-fn clone_git(url: &str, dest: &Path) -> XResult<PathBuf> {
+/// clone only the `pkg/` tree of an http git endpoint into `dest`, leaving
+/// lib/ and bin/ untouched. the working tree materializes package tomls and
+/// repo.db as blobs are fetched.
+fn clone_pkg_only(url: &str, dest: &Path) -> XResult<()> {
+    if dest.join(".git").is_dir() {
+        return pull_pkg_only(url, dest);
+    }
     if let Some(parent) = dest.parent()
         && !parent.is_dir()
     {
@@ -209,14 +245,108 @@ fn clone_git(url: &str, dest: &Path) -> XResult<PathBuf> {
             .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
     }
     let status = Command::new("git")
-        .args(["clone", "--depth", "1", url])
+        .args(["clone", "--depth", "1", "--filter=blob:none", "--sparse", url])
         .arg(dest)
         .status()
         .map_err(|e| format!("git is not available ({})", e))?;
     if !status.success() {
-        return Err(format!("failed to clone {} into {}", url, dest.display()));
+        return Err(format!("failed to fetch pkg/ from {}", url));
     }
-    Ok(dest.to_path_buf())
+    materialize_pkg(dest)
+}
+
+/// refresh an already-hooked http endpoint: reset pkg/ to origin and
+/// materialize the catalog.
+fn pull_pkg_only(_url: &str, dest: &Path) -> XResult<()> {
+    cmd_output("git", &["-C", dest.to_str().unwrap_or("."), "fetch", "origin"])?;
+    cmd_output(
+        "git",
+        &["-C", dest.to_str().unwrap_or("."), "reset", "--hard", "origin/HEAD"],
+    )?;
+    materialize_pkg(dest)
+}
+
+/// make sure the sparse checkout covers pkg/, then materialize its files
+/// (asynchronous on-demand blob fetching handled by git's partial clone).
+fn materialize_pkg(dest: &Path) -> XResult<()> {
+    cmd_output(
+        "git",
+        &[
+            "-C",
+            dest.to_str().unwrap_or("."),
+            "sparse-checkout",
+            "set",
+            crate::home::PKG_DIR,
+        ],
+    )?;
+    cmd_output(
+        "git",
+        &["-C", dest.to_str().unwrap_or("."), "checkout-index", "-a", "-f"],
+    )?;
+    Ok(())
+}
+
+/// stage the actual `lib/` and `bin/` files of a single package out of an http
+/// endpoint so `place_package` can copy them. returns the staging root (a tree
+/// with `lib/` and `bin/`). only used at install time.
+pub fn fetch_package_files(
+    home: &Home,
+    ep: &Endpoint,
+    pkg: &Package,
+) -> XResult<PathBuf> {
+    let Endpoint::Http { url, .. } = ep else {
+        return Ok(ep.pkg_dir(home).parent().unwrap_or_else(|| Path::new(".")).to_path_buf());
+    };
+    let root = ep.root(home);
+    let work = root.join("work").join(&pkg.name);
+    fs::create_dir_all(&work)
+        .map_err(|e| format!("failed to create {}: {}", work.display(), e))?;
+    if work.join(".git").is_dir() {
+        pull_pkg_files(url, &work, pkg)?;
+    } else {
+        let status = Command::new("git")
+            .args(["clone", "--depth", "1", "--filter=blob:none", "--sparse", url])
+            .arg(&work)
+            .status()
+            .map_err(|e| format!("git is not available ({})", e))?;
+        if !status.success() {
+            return Err(format!("failed to fetch package files from {}", url));
+        }
+        materialize_pkg_files(&work, pkg)?;
+    }
+    Ok(work)
+}
+
+fn pull_pkg_files(_url: &str, work: &Path, pkg: &Package) -> XResult<()> {
+    cmd_output("git", &["-C", work.to_str().unwrap_or("."), "fetch", "origin"])?;
+    cmd_output(
+        "git",
+        &["-C", work.to_str().unwrap_or("."), "reset", "--hard", "origin/HEAD"],
+    )?;
+    materialize_pkg_files(work, pkg)
+}
+
+/// sparse-checkout the `lib/` and `bin/` trees for a package and materialize them
+fn materialize_pkg_files(work: &Path, pkg: &Package) -> XResult<()> {
+    cmd_output(
+        "git",
+        &["-C", work.to_str().unwrap_or("."), "sparse-checkout", "set", "lib", "bin"],
+    )?;
+    cmd_output(
+        "git",
+        &["-C", work.to_str().unwrap_or("."), "checkout-index", "-a", "-f"],
+    )?;
+    for (dir, file) in pkg.owned_files() {
+        let path = work.join(dir).join(file);
+        if !path.is_file() {
+            return Err(format!(
+                "missing {} in http package '{}'",
+                path.display(),
+                pkg.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn cmd_output(cmd: &str, args: &[&str]) -> XResult<String> {
@@ -237,7 +367,7 @@ mod tests {
     #[test]
     fn registry_roundtrip() {
         let mut reg = EndpointRegistry::default();
-        reg.add(Endpoint::Git {
+        reg.add(Endpoint::Http {
             name: "hub".into(),
             url: "https://github.com/u/r.git".into(),
         })
@@ -262,7 +392,7 @@ mod tests {
         let loaded = EndpointRegistry::load(&home).unwrap();
         assert_eq!(loaded.endpoint.len(), 2);
         assert!(
-            matches!(loaded.get("hub"), Some(Endpoint::Git { url, .. }) if url == "https://github.com/u/r.git")
+            matches!(loaded.get("hub"), Some(Endpoint::Http { url, .. }) if url == "https://github.com/u/r.git")
         );
         assert!(
             matches!(loaded.get("local"), Some(Endpoint::Local { path, .. }) if path.as_path() == Path::new("/home/u/pkgs"))
@@ -274,13 +404,13 @@ mod tests {
     #[test]
     fn add_rejects_duplicates() {
         let mut reg = EndpointRegistry::default();
-        reg.add(Endpoint::Git {
+        reg.add(Endpoint::Http {
             name: "hub".into(),
             url: "a".into(),
         })
         .unwrap();
         assert!(
-            reg.add(Endpoint::Git {
+            reg.add(Endpoint::Http {
                 name: "hub".into(),
                 url: "b".into()
             })
@@ -293,8 +423,8 @@ mod tests {
         assert!(
             adhoc_endpoint("x", "https://github.com/u/r.git")
                 .unwrap()
-                .is_git()
+                .is_http()
         );
-        assert!(!adhoc_endpoint("x", "/tmp/somewhere").unwrap().is_git());
+        assert!(!adhoc_endpoint("x", "/tmp/somewhere").unwrap().is_http());
     }
 }
