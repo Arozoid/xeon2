@@ -1,351 +1,249 @@
+mod archive;
+mod endpoints;
+mod home;
+mod model;
+mod ops;
+mod paths;
+mod ui;
+
 use clap::{Parser, Subcommand};
 use colored::*;
 use std::path::PathBuf;
-use std::fs;
-use std::io::Write;
-use std::process::Command;
-use std::process;
-use std::env;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
-// statics
-static VERSION: &str = "0.0.1";
-static ABOUT: &str = "\u{1b}[0;32mthe 'modern' package manager\u{1b}[0m";
+use home::Home;
+use ui::err;
 
-// helper functions
-fn get_current_path() -> String {
-    env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "Unknown".to_string())
-}
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const ABOUT: &str = "xeon — the 'modern' package manager for .xeo";
 
-fn change_path(target: &PathBuf) -> Result<PathBuf, std::io::Error> {
-    env::set_current_dir(target)?;
-    // Return the absolute version so you can log exactly where you are
-    env::current_dir()
-}
-
-fn read_xeo(path: &PathBuf, reverse: bool) {
-    match fs::read_to_string(path) {
-        Ok(content) => {
-            println!("{}", "read xeo script");
-            if reverse {
-                reverse_xeo(content);
-                return;
-            }
-            handle_xeo(content);
-        },
-        Err(e) => {
-            eprintln!("{} {}", "failed to read xeo script:".red(), e);
-        }
-    }
-}
-
-fn reverse_xeo(script: String) {
-    println!("reversing xeo script...");
-
-    let initial_pwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let lines: Vec<&str> = script.lines().collect();
-    
-    let mut path_history: Vec<PathBuf> = Vec::new();
-    
-    for line in &lines {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() { continue; }
-        
-        if parts[0] == "dir" && parts.len() >= 2 {
-            path_history.push(env::current_dir().unwrap());
-            if let Err(e) = change_path(&PathBuf::from(parts[1])) {
-                eprintln!("{}", format!("[xeo] err: could not simulate path to {}: {}", parts[1], e).red());
-            }
-        }
-    }
-
-    for line in lines.into_iter().rev() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() { continue; }
-
-        match parts[0] {
-            "dir" => {
-                if let Some(parent_dir) = path_history.pop() {
-                    match change_path(&PathBuf::from(&parent_dir)) {
-                        Ok(_) => println!("{}", format!("[xeo] moved out to: {}", parent_dir.display()).green()),
-                        Err(e) => eprintln!("{}", format!("[xeo] err: failed to move back: {}", e).red()),
-                    }
-                }
-            }
-            "mkdir" => {
-                if parts.len() >= 2 {
-                    let dir_name = parts[1];
-                    match fs::remove_dir_all(dir_name) {
-                        Ok(_) => println!("{}", format!("[xeo] deleted directory: {}", dir_name).green()),
-                        Err(e) => eprintln!("{}", format!("[xeo] err: failed to delete directory {}: {}", dir_name, e).red()),
-                    }
-                }
-            },
-            "make" => {
-                if parts.len() >= 2 {
-                    let file_name = parts[1];
-                    match fs::remove_file(file_name) {
-                        Ok(_) => println!("{}", format!("[xeo] deleted file: {}", file_name).green()),
-                        Err(e) => eprintln!("{}", format!("[xeo] err: failed to delete file {}: {}", file_name, e).red()),
-                    }
-                }
-            },
-            "move" => {
-                if parts.len() == 3 {
-                    let src = parts[1];
-                    let dest = parts[2];
-                    if let Err(e) = fs::rename(dest, src) {
-                        eprintln!("{}", format!("[xeo] err: failed to restore move {} to {}: {}", dest, src, e).red());
-                    } else {
-                        println!("{}", format!("[xeo] restored move: {} back to {}", dest, src).green());
-                    }
-                }
-            },
-            "print" | "chmod" => {
-                // No action needed for reversal
-            },
-            _ => {
-                eprintln!("{}", format!("[xeo] err: unknown command '{}'", parts[0]).red());
-            }
-        }
-    }
-
-    let _ = change_path(&initial_pwd);
-}
-
-fn handle_xeo(script: String) {
-    println!("{}", "handling xeo script...");
-    let pwd = PathBuf::from(get_current_path());
-    let mut dir = home::home_dir().unwrap().join(".xeon");
-    for line in script.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() { continue; }
-
-        match parts[0] {
-            "dir" => {
-                if parts.len() < 2 {
-                    eprintln!("{} {}", "[xeo] err: ".red(), "dir requires a directory name")
-                }
-                dir = PathBuf::from(parts[1]);
-                match change_path(&dir) {
-                    Ok(abs_path) => {
-                        println!("{} {}", "[xeo] moved to:".green(), abs_path.display());
-                    },
-                    Err(e) => {
-                        eprintln!("{} {}", "[xeo] err: failed to change directory:".red(), e);
-                    }
-                }       
-            }
-            "mkdir" => {
-                if parts.len() < 2 {
-                    eprintln!("{} {}", "[xeo] err:".red(), "mkdir requires a directory name");
-                    continue;
-                }
-                let dir_name = parts[1];
-                match fs::create_dir_all(dir_name) {
-                    Ok(_) => println!("{} {}", "[xeo] created directory:".green(), dir_name),
-                    Err(e) => eprintln!("{} {}: {}", "[xeo] err: failed to create directory".red(), dir_name, e),
-                }
-            },
-            "make" => {
-                if parts.len() < 2 {
-                    eprintln!("{} {}", "[xeo] err:".red(), "make requires a file name");
-                    continue;
-                }
-                let file_name = parts[1];
-                match fs::File::create(file_name) {
-                    Ok(_) => println!("{} {}", "[xeo] created file:".green(), file_name),
-                    Err(e) => eprintln!("{} {}: {}", "[xeo] err: failed to create file".red(), file_name, e),
-                }
-            },
-            "print" => {
-                if parts.len() < 2 {
-                    eprintln!("{} {}", "[xeo] err:".red(), "print requires a string to print");
-                    continue;
-                }
-                let to_print = parts[1..].join(" ");
-                println!("{}", to_print);
-            },
-            "move" => {
-                if parts.len() < 3 {
-                    eprintln!("{} {}", "[xeo] err:".red(), "move requires source and destination");
-                    continue;
-                }
-                let src = parts[1];
-                let dest = parts[2];
-                match fs::rename(src, dest) {
-                    Ok(_) => println!("{} {} {}", "[xeo] moved".green(), src, format!("to {}", dest).green()),
-                    Err(e) => eprintln!("{} {} to {}: {}", "[xeo] err: failed to move".red(), src, dest, e),
-                }
-            },
-            "chmod" => {
-                let mut permissions = fs::metadata(parts[1]).expect("reason").permissions();
-                #[cfg(unix)]
-                {
-                    permissions.set_mode(0o700);
-                }
-
-                #[cfg(not(unix))]
-                {
-                    permissions.set_readonly(false);
-                }
-
-                let _ = fs::set_permissions(parts[1], permissions);
-                println!("{} {}", "[xeo] set executable permissions for:".green(), parts[1]);
-            },
-            // "shell" => {
-            //     if parts.len() < 2 {
-            //         eprintln!("{} {}", "xeo: err:".red(), "shell requires a command to execute");
-            //         continue;
-            //     }
-            //     let cmd = parts[1..].join(" ");
-            //     match Command::new("sh").arg("-c").arg(cmd).status() {
-            //         Ok(status) => {
-            //             if status.success() {
-            //                 println!("{} {} {}", "shell command".green(), &cmd, "executed successfully.".green());
-            //             } else {
-            //                 eprintln!("{} {}", "shell command failed with status:".red(), status);
-            //             }
-            //         },
-            //         Err(e) => eprintln!("{} {}", "failed to execute shell command:".red(), e),
-            //     }
-            // },
-            _ => {
-                eprintln!("{} {}", "[xeo] err:".red(), format!("unknown command '{}'", parts[0]));
-            }
-        }
-    }
-    match change_path(&pwd) {
-        Ok(_) => {},
-        Err(e) => {
-            eprintln!("{} {}", "[xeo] fatal:".red(), e);
-            process::exit(1);
-        },
-    }
-}
-
-// handler functions
-fn handle_init() {
-    // find home directory
-    let home_dir = match home::home_dir() {
-        // return if found
-        Some(path) => path,
-        // if no home directory send error message
-        None => {
-            eprintln!("{}", "could not determine home directory!".red());
-            return;
-        }
-    };
-    
-    // if found, then add .xeon
-    let xeon_dir = home_dir.join(".xeon");
-
-    if xeon_dir.exists() {
-        println!("{}", "xeon is already initialized.".yellow());
-        return;
-    }
-
-    
-}
-
-// cli structs & enums
 #[derive(Parser)]
-#[command(name = "xeon", about = ABOUT)]
+#[command(
+    name = "xeon",
+    version = VERSION,
+    about = ABOUT,
+    arg_required_else_help = true,
+    after_help = "endpoints are trees sharing the xeon layout (lib/, bin/, pkg/).\ninstall from a local path, a .tar.gz archive, a git url, a named\nendpoint (endpoint/pkg), or a bare package name searched across endpoints."
+)]
 struct Cli {
     #[command(subcommand)]
-    command: UserCommands
+    command: UserCommands,
 }
 
 #[derive(Subcommand)]
 enum UserCommands {
-    /// check xeon version
-    Version,
-    /// refresh package database
-    Update,
-    /// adds a package
-    Add { pkg: String },
-    /// removes a package
-    Rm { pkg: String },
-    /// adds a new repository
-    AddRepo { url: String },
-    /// removes a repository
-    RmRepo { alias: String },
-    /// upgrades a package
-    Upgrade { pkg: String },
-    /// initializes xeon (if not already initialized)
+    /// scaffold the ~/.xeon install tree and endpoints file
     Init,
-    /// runs custom .xeo file
-    Xeo { 
-        path: PathBuf,
-
-        #[arg(short = 'r', long = "reverse", default_value_t = false)]
-        reverse: bool,
+    /// install a package from a path, archive, git url, endpoint, or name
+    #[command(visible_alias = "add")]
+    Install {
+        /// package spec: name | endpoint/name | path | archive | git-url[#name]
+        pkg: String,
+        /// overwrite an already-installed package
+        #[arg(short, long)]
+        force: bool,
+        /// show what would happen without touching the filesystem
+        #[arg(short, long)]
+        dry_run: bool,
     },
-    // interacts with commands in the community repo
-    // Dev {
-    //     #[command(subcommand)]
-    //     cmd: DevCommands,
-    // },
+    /// remove an installed package and its files
+    #[command(visible_alias = "rm")]
+    Remove {
+        pkg: String,
+        /// skip the confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// list installed packages
+    #[command(visible_alias = "ls")]
+    List,
+    /// search every endpoint for packages matching a query
+    Search { query: String },
+    /// show metadata for an installed package (or any endpoint package)
+    Info { pkg: String },
+    /// refresh git endpoints from their origin
+    Update,
+    /// upgrade installed packages from their recorded origins
+    Upgrade {
+        /// upgrade only this package (default: all)
+        pkg: Option<String>,
+        /// reinstall even when versions match
+        #[arg(short, long)]
+        force: bool,
+        /// show what would happen without touching the filesystem
+        #[arg(short, long)]
+        dry_run: bool,
+    },
+    /// manage package endpoints
+    Endpoint {
+        #[command(subcommand)]
+        cmd: EndpointCmd,
+    },
+    /// scaffold a new package tree that can be installed or shared
+    New {
+        /// package name
+        name: String,
+        /// parent directory for the new package (default: current dir)
+        #[arg(short = 'd', long)]
+        dir: Option<PathBuf>,
+    },
+    /// package a package tree (lib/bin/pkg) into a <name>-<version>.tar.gz
+    Build {
+        /// the package directory to build
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// output location (file, or directory to put <name>-<version>.tar.gz in)
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+    /// install the xeo interpreter binary into ~/.xeon/bin/xeo
+    Bootstrap {
+        /// path to a built xeo binary
+        source: PathBuf,
+    },
+    /// basic diagnostics for this machine
+    Doctor,
+    /// empty the download cache (~/.xeon/cache/dl)
+    Clean,
+    /// print version
+    Version,
 }
 
-// #[derive(Subcommand)]
-// enum DevCommands {
-//     Add,
-//     Edit { pkg: String },
-//     Rm { pkg: String },
-// }
+#[derive(Subcommand)]
+enum EndpointCmd {
+    /// add an endpoint (git:// or path)
+    Add { name: String, location: String },
+    /// remove an endpoint by name
+    #[command(visible_alias = "rm")]
+    Remove { name: String },
+    /// list configured endpoints
+    List,
+    /// show where a named endpoint resolves on disk
+    Path { name: String },
+}
 
 fn main() {
-    // grab args
     let cli = Cli::parse();
 
-    // route them
-    match cli.command {
-        UserCommands::Add { pkg } => {
-            println!("{} {}{}", "installing".green(), pkg, "...".green());
+    let home = Home::resolve();
+    let registry = match endpoints::EndpointRegistry::load(&home) {
+        Ok(reg) => reg,
+        Err(e) => {
+            err(e);
+            std::process::exit(1);
+        }
+    };
+
+    let result = match cli.command {
+        UserCommands::Init => ops::init(&home),
+        UserCommands::Install {
+            pkg,
+            force,
+            dry_run,
+        } => ops::install(&home, &registry, &pkg, force, dry_run),
+        UserCommands::Remove { pkg, yes } => ops::remove(&home, &pkg, yes),
+        UserCommands::List => ops::list(&home),
+        UserCommands::Search { query } => ops::search(&home, &registry, &query),
+        UserCommands::Info { pkg } => ops::info(&home, &registry, &pkg),
+        UserCommands::Update => ops::update(&home, &registry),
+        UserCommands::Upgrade {
+            pkg,
+            force,
+            dry_run,
+        } => ops::upgrade(&home, &registry, pkg.map(|p| vec![p]), force, dry_run),
+        UserCommands::Endpoint { cmd } => handle_endpoint(&home, &registry, cmd),
+        UserCommands::New { name, dir } => ops::new_package(&name, dir.as_deref()),
+        UserCommands::Build { dir, out } => ops::build_package(&home, &dir, out.as_deref()),
+        UserCommands::Bootstrap { source } => ops::bootstrap(&home, &source),
+        UserCommands::Doctor => match ops::doctor(&home, &registry) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e),
         },
-        UserCommands::Rm { pkg } => {
-            println!("{} {}{}", "removing".green(), pkg, "...".green());
-        },
-        UserCommands::Update => {
-            println!("{}", "refreshing package database...".green());
-        },
-        UserCommands::Upgrade { pkg } => {
-            println!("{} {}{}", "upgrading".green(), pkg, "...");
-        },
+        UserCommands::Clean => ops::clean(&home),
         UserCommands::Version => {
-            println!("{}", "xeon: the 'modern' package manager".green());
+            println!("{}", "xeon — the .xeo package manager".green());
             println!("v{}", VERSION);
+            Ok(())
+        }
+    };
+
+    if let Err(e) = result {
+        err(e);
+        std::process::exit(1);
+    }
+}
+
+fn handle_endpoint(
+    home: &Home,
+    registry: &endpoints::EndpointRegistry,
+    cmd: EndpointCmd,
+) -> home::XResult<()> {
+    let mut reg = registry.clone();
+    match cmd {
+        EndpointCmd::Add { name, location } => {
+            let ep = endpoints::adhoc_endpoint(&name, &location)?;
+            reg.add(ep.clone())?;
+            reg.save(home)?;
+            let root = ep.ensure(home)?;
+            let count = endpoints::scan_root(&root)?.len();
+            let kind = if ep.is_git() { "git" } else { "local" };
+            ui::ok(format!(
+                "added {} endpoint '{}' at {} ({} packages)",
+                kind,
+                name.cyan(),
+                root.display(),
+                count
+            ));
+            Ok(())
+        }
+        EndpointCmd::Remove { name } => {
+            if !reg.remove(&name) {
+                return Err(format!("endpoint '{}' not found", name));
+            }
+            reg.save(home)?;
+            ui::ok(format!("removed endpoint '{}'", name.cyan()));
+            Ok(())
+        }
+        EndpointCmd::List => {
+            if reg.endpoint.is_empty() {
+                ui::info("no endpoints configured");
+                return Ok(());
+            }
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            for ep in &reg.endpoint {
+                let kind = if ep.is_git() { "git" } else { "local" };
+                let loc = match ep {
+                    endpoints::Endpoint::Local { path, .. } => path.display().to_string(),
+                    endpoints::Endpoint::Git { url, .. } => url.clone(),
+                };
+                let root = ep
+                    .ensure(home)
+                    .ok()
+                    .map(|r| r.display().to_string())
+                    .unwrap_or_default();
+                let count = ep
+                    .ensure(home)
+                    .ok()
+                    .and_then(|r| endpoints::scan_root(&r).ok())
+                    .map(|v| v.len())
+                    .unwrap_or(0);
+                rows.push(vec![
+                    ep.name().to_string(),
+                    kind.to_string(),
+                    loc,
+                    root,
+                    count.to_string(),
+                ]);
+            }
+            ui::table(&["name", "kind", "location", "resolves to", "pkgs"], &rows);
+            Ok(())
+        }
+        EndpointCmd::Path { name } => match reg.get(&name) {
+            Some(ep) => {
+                let root = ep.ensure(home)?;
+                println!("{}", root.display());
+                Ok(())
+            }
+            None => Err(format!("endpoint '{}' not found", name)),
         },
-        UserCommands::AddRepo { url } => {
-            println!("{} {}", "adding new repo:".green(), url);
-        },
-        UserCommands::RmRepo { alias } => {
-            println!("{} {} {}", "removing".green(), alias, "repo...".green());
-        },
-        UserCommands::Init => {
-            println!("{}", "initializing xeon...".green());
-            handle_init();
-        },
-        UserCommands::Xeo { path, reverse } => {
-            println!("{} {:?}", "running xeo script at".green(), path);
-            read_xeo(&path, reverse);
-        },
-        // UserCommands::Dev { cmd } => {
-        //     match cmd {
-        //         DevCommands::Add => {
-        //             println!("{} {} {}", "adding package to".green(), "community", "repo...".green());
-        //         },
-        //         DevCommands::Edit { pkg } => {
-        //             println!("{} {}", "editing package:".green(), pkg);
-        //         },
-        //         DevCommands::Rm { pkg } => {
-        //             println!("{} {}", "removing package from xeon-dev:".green(), pkg);
-        //         },
-        //     }
-        // }
     }
 }
