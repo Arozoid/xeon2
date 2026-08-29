@@ -873,6 +873,13 @@ pub fn doctor(home: &Home, reg: &EndpointRegistry) -> XResult<()> {
 
     println!("{}", "xeon doctor".cyan().bold());
     println!("  {}: {}", "home".bold(), home.root().display());
+    ui::info(format!(
+        "host {} (key {} — {} {})",
+        crate::arch::host_triple(),
+        crate::arch::arch_platform(),
+        crate::arch::host_arch(),
+        crate::arch::host_platform()
+    ));
 
     if home.is_initialized() {
         ui::ok("xeon home initialized");

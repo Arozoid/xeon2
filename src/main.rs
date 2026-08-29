@@ -1,4 +1,5 @@
 mod archive;
+mod arch;
 mod endpoints;
 mod home;
 mod model;
@@ -103,6 +104,8 @@ enum UserCommands {
     },
     /// basic diagnostics for this machine
     Doctor,
+    /// report this machine's architecture / platform target
+    Arch,
     /// empty the download cache (~/.xeon/cache/dl)
     Clean,
     /// print version
@@ -160,9 +163,17 @@ fn main() {
             Err(e) => Err(e),
         },
         UserCommands::Clean => ops::clean(&home),
+        UserCommands::Arch => {
+            println!("arch     {}", arch::host_arch().green());
+            println!("platform {}", arch::host_platform().green());
+            println!("key      {}", arch::arch_platform().green());
+            println!("triple   {}", arch::host_triple().green());
+            Ok(())
+        }
         UserCommands::Version => {
             println!("{}", "xeon — the .xeo package manager".green());
             println!("v{}", VERSION);
+            println!("for {} ({}, {})", arch::host_triple(), arch::host_platform(), arch::host_arch());
             Ok(())
         }
     };

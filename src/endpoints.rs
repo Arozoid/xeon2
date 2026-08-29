@@ -137,8 +137,29 @@ impl EndpointRegistry {
         }
         let source = fs::read_to_string(&path)
             .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
-        let mut reg: EndpointRegistry =
-            toml::from_str(&source).map_err(|e| format!("invalid {}: {}", path.display(), e))?;
+        let parsed = toml::from_str(&source);
+        let mut reg: EndpointRegistry = match parsed {
+            Ok(reg) => reg,
+            Err(_) => {
+                // legacy configs (pre-http refactor) used kind = "git"; accept
+                // them by rewriting to the current kind without failing.
+                let migrated = source
+                    .lines()
+                    .map(|line| {
+                        let t = line.trim();
+                        if t.starts_with("kind") && (t.ends_with("\"git\"") || t.ends_with("\"ssh\"")) {
+                            line.replace("\"git\"", "\"http\"").replace("\"ssh\"", "\"http\"")
+                        } else {
+                            line.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                toml::from_str(&migrated).map_err(|e| {
+                    format!("invalid {}: {}", path.display(), e)
+                })?
+            }
+        };
         reg.endpoint.retain(|ep| !ep.name().is_empty());
         reg.endpoint.dedup_by(|a, b| a.name() == b.name());
         Ok(reg)
